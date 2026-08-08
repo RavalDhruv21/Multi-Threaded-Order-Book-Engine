@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y g++-13
+
+      - name: Build (raw g++ invocation, matches README)
+        run: |
+          g++-13 -O3 -std=c++20 -pthread -Wall -Wextra -Wpedantic -Iinclude src/main.cpp -o orderbook_bench
+          g++-13 -O2 -std=c++20 -pthread -Wall -Wextra -Wpedantic -Iinclude tests/test_orderbook.cpp -o orderbook_tests
+
+      - name: Run functional tests
+        run: ./orderbook_tests
+
+      - name: Run benchmark
+        run: ./orderbook_bench

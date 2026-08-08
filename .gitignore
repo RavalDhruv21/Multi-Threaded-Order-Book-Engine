@@ -1,0 +1,14 @@
+build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+*.out
+.vscode/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+orderbook_bench
+orderbook_tests
+.claude/
