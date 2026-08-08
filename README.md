@@ -72,8 +72,10 @@ Three things here are meant to actually hold up under scrutiny:
 | [`include/MemoryPool.hpp`](include/MemoryPool.hpp) | Fixed-capacity slab allocator: `acquire()`/`release()` are O(1) free-list push/pop. No `new`/`delete`/`malloc` after startup. |
 | [`include/SPSCQueue.hpp`](include/SPSCQueue.hpp) | Lock-free single-producer/single-consumer ring buffer. `std::atomic<size_t>` head/tail, cache-line padded, `acquire`/`release` ordering only (no `seq_cst`, no mutex). |
 | [`include/OrderBook.hpp`](include/OrderBook.hpp) | The engine: `SummaryBitmap`, the cache-line-sized intrusive `Order` node, `PriceLevel`, and `OrderBook::match_or_add / cancel_order / amend_order`. |
-| [`src/main.cpp`](src/main.cpp) | Two-thread benchmark harness: producer floods 100,000 random crossing orders through the queue, consumer times every `match_or_add()` call and reports mean/p50/p90/p99/p99.9/max latency. |
+| [`src/main.cpp`](src/main.cpp) | Two-thread benchmark harness: producer floods 100,000 random crossing orders through the queue, consumer times every `match_or_add()` call and reports mean/p50/p90/p99/p99.9/max latency. Threads pinned to separate cores on Linux. |
 | [`tests/test_orderbook.cpp`](tests/test_orderbook.cpp) | Dependency-free functional tests: price-time priority, partial fills, market-order sweep-and-IOC-drop, O(1) cancel, stale-handle rejection, amend semantics, pool exhaustion. |
+| [`benchmarks/NaiveOrderBook.hpp`](benchmarks/NaiveOrderBook.hpp) | `std::map`/`std::list`/`std::unordered_map` baseline engine — a measurement fixture only, not part of the production path. |
+| [`benchmarks/compare_main.cpp`](benchmarks/compare_main.cpp) | Single-threaded head-to-head: identical order sequence through both engines, reports latency percentiles for each. See [Measured performance](#measured-performance). |
 
 ## Core data structures
 
@@ -154,6 +156,65 @@ Classic Vyukov-style single-producer/single-consumer ring buffer:
 | `amend_order` (price change / qty increase) | O(1) amortized | cancel + re-insert (cancel-replace, loses priority — matches real exchange behavior) |
 | best bid / best ask | O(1) | two-level summary bitmap, ≤2 bit-scan instructions |
 
+## Measured performance
+
+Measured on an AWS EC2 `c7i-flex.large` (2 vCPU, Intel Sapphire Rapids,
+us-east-1) — a dedicated cloud instance rather than a laptop or WSL,
+specifically so the numbers aren't skewed by shared/burstable CPU credits.
+Ubuntu 24.04, `g++ 13.3.0`, `-O3 -std=c++20 -pthread`. Producer and consumer
+threads pinned to separate cores (`pin_to_core()` in `main.cpp`) to keep the
+scheduler from bouncing them mid-run.
+
+**Full pipeline** — 100,000 randomized crossing orders through the SPSC
+queue end-to-end (`./orderbook_bench`):
+
+| Metric | Value |
+|---|---|
+| Throughput | 10.73M orders/sec |
+| Mean latency | 57.2 ns |
+| p50 | 53 ns |
+| p90 | 82 ns |
+| p99 | 127 ns |
+| p99.9 | 183 ns |
+| max | 15.3 µs |
+
+**Engine-only comparison against a naive baseline** — same 100,000-order
+sequence (identical RNG seed), single-threaded, no queue in the loop, so
+this isolates the matching engine itself from pipeline/threading overhead.
+The naive baseline (`benchmarks/NaiveOrderBook.hpp`) is the "obvious first
+draft" every engineer reaches for: `std::map<Price, std::list<Order>>` for
+price levels plus `std::unordered_map` for cancel lookup — real heap
+allocations on every order, red-black-tree traversal for level lookup. Both
+binaries built identically and run back-to-back on the same instance:
+
+| Metric | This engine | Naive (`std::map`+`std::list`) | Delta |
+|---|---|---|---|
+| Throughput | 11.94M orders/sec | 5.89M orders/sec | 2.0x |
+| Mean latency | 54.1 ns | 137.8 ns | 2.5x |
+| p50 | 50 ns | 124 ns | 2.5x |
+| p90 | 77 ns | 196 ns | 2.5x |
+| p99 | 122 ns | 360 ns | 3.0x |
+| max | 17.6 µs | 165.6 µs | 9.4x |
+
+Reproduce it:
+```bash
+g++ -O3 -std=c++20 -pthread -Iinclude benchmarks/compare_main.cpp -o compare_bench
+./compare_bench optimized
+./compare_bench naive
+```
+
+**What we deliberately did not claim**: a `perf stat` cache-miss/instruction
+comparison was attempted to back the "fewer allocations, better cache
+locality" argument with hardware counters instead of just structural
+reasoning. Every EC2 instance type available (including compute-optimized
+`c7i-flex.large`) reports hardware PMU counters as `<not supported>` to the
+guest OS — a virtualization limitation of non-bare-metal EC2, not something
+fixable from inside the VM. Rather than assert numbers that weren't
+actually measured, the latency table above stands on its own, and the
+*mechanism* behind it (allocation-per-order in the naive version vs.
+zero-allocation pooled/intrusive design here) is explained structurally in
+[Core data structures](#core-data-structures) instead.
+
 ## Build & run
 
 ```bash
@@ -197,13 +258,46 @@ exist:
 - **4,096 price-tick range by default.** A direct consequence of the
   two-level bitmap fitting in one summary word. Documented extension path:
   a 3-level bitmap for wider ranges (same technique, one more level).
-- **Single matching-engine thread.** Sharding by symbol across multiple
-  engine instances (each single-threaded, each fed by its own SPSC queue)
-  is the standard way real systems parallelize this — a shared mutable book
-  matched by multiple threads is a correctness hazard, not a performance
-  win.
 - **No persistence / recovery log.** Out of scope for a benchmark harness;
-  a real venue would journal every accepted order for replay/audit.
+  see "Recovery" below for how this would actually be added.
 - **IOC-only market orders.** Market orders sweep the book and drop any
   unfilled remainder rather than resting — this is standard market-order
   semantics, not a shortcut.
+
+## Scaling beyond a single instrument
+
+This engine is deliberately single-threaded *for matching* — `OrderBook` is
+not internally synchronized, and that's a design choice, not an oversight.
+Two things worth being explicit about for anyone extending this:
+
+**Sharding, not shared-memory parallelism.** The tempting-looking "fix" for
+more throughput is to let multiple threads call `match_or_add` on one
+`OrderBook` concurrently, guarded by a lock or made lock-free with CAS. Real
+venues don't do this, for the same reason this project doesn't: a limit
+order book's correctness *is* its ordering (price-time priority is, by
+definition, a total order over events), so multiple writers racing to
+mutate one book either serializes them anyway (a lock, at which point
+you've paid all the synchronization cost for none of the benefit over just
+being single-threaded) or introduces genuine correctness bugs in matching
+order. The actual scaling axis is **sharding by instrument**: one
+`OrderBook` + one dedicated matching thread + one dedicated `SPSCQueue` feed
+per symbol, so BTC-USD and ETH-USD matching are entirely independent and
+trivially run on separate cores with zero coordination between them. This
+project's `SPSCQueue` + single-`OrderBook`-per-thread structure is already
+shaped for that — running N instruments is N independent copies of exactly
+this pipeline, not a redesign.
+
+**Recovery.** A real venue can't lose the book on a crash, which means every
+accepted order/cancel/amend needs to be durable *before* it's acknowledged.
+The standard approach — and the one this design is already compatible with
+— is an append-only write-ahead log: serialize each `IncomingOrder` /
+cancel / amend to a log (or a replicated stream like Kafka) *before* calling
+into `OrderBook`, fsync or replicate for durability, then apply it. Recovery
+after a crash is: replay the log from the last durable snapshot, re-running
+every `match_or_add`/`cancel_order`/`amend_order` call in the same order
+they originally happened in. This works cleanly here specifically *because*
+the engine is deterministic and single-threaded — replaying the same
+sequence of calls against a fresh `OrderBook` reproduces the exact same
+state, with no concurrent-mutation ordering ambiguity to reconcile. That
+determinism is a direct payoff of not having gone the "lock-free concurrent
+book" route above.
