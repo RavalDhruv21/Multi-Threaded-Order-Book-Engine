@@ -26,7 +26,27 @@
 #include "SPSCQueue.hpp"
 #include "Types.hpp"
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace {
+
+// Pins the calling thread to a single core. On a 2-vCPU box (e.g. an EC2
+// t3.micro) this keeps the producer and consumer from being bounced between
+// cores by the scheduler mid-run, which otherwise shows up as tail-latency
+// noise that has nothing to do with the engine itself. No-op on non-Linux.
+void pin_to_core(int core) {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)core;
+#endif
+}
 
 constexpr std::size_t kNumOrders   = 100'000;
 constexpr std::size_t kQueueCap    = 1u << 16; // must be a power of two
@@ -38,6 +58,7 @@ constexpr hft::Quantity kMaxQty    = 500;
 using Queue = hft::SPSCQueue<hft::IncomingOrder, kQueueCap>;
 
 void producer(Queue& queue, std::atomic<bool>& done) {
+    pin_to_core(0);
     std::mt19937 rng(0xC0FFEE);
     std::uniform_int_distribution<std::uint32_t> price_dist(kMinPrice, kMaxPrice);
     std::uniform_int_distribution<std::uint32_t> qty_dist(kMinQty, kMaxQty);
@@ -108,6 +129,7 @@ int main() {
     latencies_ns.reserve(kNumOrders); // pre-reserved: measurement loop below never allocates
 
     std::thread producer_thread(producer, std::ref(queue), std::ref(producer_done));
+    pin_to_core(1); // consumer runs on the main thread -- pin it to the other core
 
     // Pin-free consumer loop: drain until the producer is done AND the
     // queue is empty (order matters -- check done *before* re-checking

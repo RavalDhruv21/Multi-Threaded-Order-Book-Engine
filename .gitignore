@@ -11,4 +11,5 @@ CMakeCache.txt
 compile_commands.json
 orderbook_bench
 orderbook_tests
+compare_bench
 .claude/

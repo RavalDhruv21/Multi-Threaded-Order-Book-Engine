@@ -19,6 +19,9 @@ include_directories(include)
 add_executable(orderbook_bench src/main.cpp)
 target_link_libraries(orderbook_bench PRIVATE Threads::Threads)
 
+add_executable(compare_bench benchmarks/compare_main.cpp)
+target_link_libraries(compare_bench PRIVATE Threads::Threads)
+
 enable_testing()
 add_executable(orderbook_tests tests/test_orderbook.cpp)
 target_link_libraries(orderbook_tests PRIVATE Threads::Threads)
