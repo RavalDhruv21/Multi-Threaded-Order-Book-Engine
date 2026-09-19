@@ -1,8 +1,13 @@
 // MemoryPool.hpp
-// Fixed-capacity, array-backed slab allocator. Every slot is carved out of a
-// single contiguous, cache-line-aligned array at startup; acquire()/release()
-// are O(1) array-index push/pop on a free-list -- no `new`, `delete`,
-// `malloc`, or `std::shared_ptr` ever touch the hot path.
+// A fixed-capacity, array-backed slab allocator for high-performance memory management.
+//
+// Key Design Goal:
+// Dynamic memory allocation (`new`, `delete`, `malloc`, `free`) causes non-deterministic
+// latency spikes due to heap management overhead and fragmentation.
+//
+// MemoryPool pre-allocates a contiguous array of slots at startup.
+// Acquiring and releasing slots are O(1) stack push/pop index operations on a free-list,
+// ensuring zero dynamic heap allocations during runtime order processing.
 #pragma once
 
 #include <array>
@@ -15,62 +20,69 @@ namespace hft {
 
 template <typename T, std::size_t Capacity>
 class MemoryPool {
-    static_assert(Capacity > 0 && Capacity <= (std::size_t{1} << 32),
-                  "Capacity must fit in a uint32_t slot index");
+    static_assert(Capacity > 0 && static_cast<std::uint64_t>(Capacity) <= (std::uint64_t{1} << 32),
+                  "MemoryPool Capacity must fit within a 32-bit slot index.");
 
 public:
+    // Initializes the pool by populating the free-list with available slot indices [0, Capacity - 1].
     MemoryPool() noexcept {
-        // free_list_[0] holds the slot that will be handed out *last*; we pop
-        // from the back, so push slots on in descending order to acquire 0,1,2,...
-        // on a freshly constructed pool (nicer for debugging, not required).
-        for (std::size_t i = 0; i < Capacity; ++i) {
-            free_list_[i] = static_cast<std::uint32_t>(Capacity - 1 - i);
+        // Populate the free-list in descending order so that slot 0 is popped first.
+        // This produces sequential slot allocation (0, 1, 2, ...) on a fresh pool.
+        for (std::size_t index = 0; index < Capacity; ++index) {
+            free_slot_list_[index] = static_cast<std::uint32_t>(Capacity - 1 - index);
         }
-        free_top_ = Capacity;
+        available_slots_count_ = Capacity;
     }
 
+    // Disable copy construction and copy assignment to prevent accidental pool duplication.
     MemoryPool(const MemoryPool&)            = delete;
     MemoryPool& operator=(const MemoryPool&) = delete;
 
-    // O(1). Returns kNullIndex if the pool is exhausted (caller decides how
-    // to handle backpressure -- the engine treats it as an order rejection,
-    // never blocks or allocates).
+    // Acquires a free slot from the pool in O(1) time.
+    // Returns the slot index, or kNullIndex if the memory pool is exhausted.
     [[nodiscard]] std::uint32_t acquire() noexcept {
-        if (free_top_ == 0) [[unlikely]] {
-            return kNullIndex;
+        if (available_slots_count_ == 0) {
+            return kNullIndex; // Pool is full: caller handles backpressure/rejection
         }
-        return free_list_[--free_top_];
+        // Pop the top available slot index from the free list
+        return free_slot_list_[--available_slots_count_];
     }
 
-    // O(1). Slot must have come from acquire() on this pool and not have
-    // been released twice (checked in debug builds only -- no cost in -O3).
-    void release(std::uint32_t slot) noexcept {
-        assert(free_top_ < Capacity && "MemoryPool::release: free-list overflow (double free?)");
-        assert(slot < Capacity);
-        free_list_[free_top_++] = slot;
+    // Releases a previously acquired slot back to the free list in O(1) time.
+    void release(std::uint32_t slot_index) noexcept {
+        assert(available_slots_count_ < Capacity && "MemoryPool::release: Free list overflow (double free error).");
+        assert(slot_index < Capacity && "MemoryPool::release: Slot index out of bounds.");
+
+        // Push the released slot index back onto the free list stack
+        free_slot_list_[available_slots_count_++] = slot_index;
     }
 
-    [[nodiscard]] T& operator[](std::uint32_t slot) noexcept {
-        assert(slot < Capacity);
-        return storage_[slot];
-    }
-    [[nodiscard]] const T& operator[](std::uint32_t slot) const noexcept {
-        assert(slot < Capacity);
-        return storage_[slot];
+    // Direct O(1) subscript access to an allocated object in the pool.
+    [[nodiscard]] T& operator[](std::uint32_t slot_index) noexcept {
+        assert(slot_index < Capacity && "MemoryPool::operator[]: Slot index out of bounds.");
+        return storage_slab_[slot_index];
     }
 
+    [[nodiscard]] const T& operator[](std::uint32_t slot_index) const noexcept {
+        assert(slot_index < Capacity && "MemoryPool::operator[]: Slot index out of bounds.");
+        return storage_slab_[slot_index];
+    }
+
+    // Pool capacity and usage statistics
     [[nodiscard]] std::size_t capacity() const noexcept { return Capacity; }
-    [[nodiscard]] std::size_t available() const noexcept { return free_top_; }
-    [[nodiscard]] std::size_t in_use() const noexcept { return Capacity - free_top_; }
+    [[nodiscard]] std::size_t available() const noexcept { return available_slots_count_; }
+    [[nodiscard]] std::size_t in_use() const noexcept { return Capacity - available_slots_count_; }
 
 private:
-    // The slab itself: one contiguous, cache-aligned allocation made once at
-    // construction (embedded directly in the OrderBook / engine object, so in
-    // practice this lives on the process's static/heap allocation done a
-    // single time at startup -- never during order processing).
-    alignas(64) std::array<T, Capacity> storage_{};
-    alignas(64) std::array<std::uint32_t, Capacity> free_list_{};
-    std::size_t free_top_ = 0;
+    // Contiguous storage array holding all pre-allocated objects (e.g., Order nodes)
+    alignas(64) std::array<T, Capacity> storage_slab_{};
+
+    // Stack storing indices of currently unallocated (free) slots
+    alignas(64) std::array<std::uint32_t, Capacity> free_slot_list_{};
+
+    // Number of available free slots remaining in the pool
+    std::size_t available_slots_count_ = 0;
 };
 
 } // namespace hft
+

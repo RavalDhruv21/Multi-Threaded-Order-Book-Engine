@@ -1,88 +1,168 @@
 // Types.hpp
-// Strongly-typed primitives shared across the engine. Nothing here allocates
-// or does anything clever -- it exists purely so that "price" and "quantity"
-// can never be silently swapped at a call site (a real bug class in OMS code).
+// Clean, readable domain types, order structures, and standard container
+// representations for a C++ Order Book matching engine.
+//
+// Designed for clarity and ease of understanding by intermediate programmers.
 #pragma once
 
 #include <cstdint>
 #include <limits>
+#include <vector>
+#include <map>
+#include <list>
+#include <string>
 
 namespace hft {
 
 // ---------------------------------------------------------------------------
-// Domain primitives
+// Basic Domain Primitives
 // ---------------------------------------------------------------------------
 
-// Prices are integer ticks, not floating point. Floating point prices are a
-// classic correctness bug in matching engines (0.1 + 0.2 != 0.3): every real
-// exchange represents price as an integer multiple of a tick size.
-using Price    = std::uint32_t;
+// Prices are represented as integer ticks rather than floating-point numbers.
+// In financial systems, floating-point math causes precision issues (e.g.,
+// 0.1 + 0.2 != 0.3). Using integer ticks guarantees exact arithmetic.
+using Price = std::uint32_t;
+
+// Quantity represents the number of shares or contracts in an order.
 using Quantity = std::uint32_t;
-using OrderId  = std::uint64_t;
 
-enum class Side : std::uint8_t { Buy = 0, Sell = 1 };
-
-enum class OrderType : std::uint8_t { Limit = 0, Market = 1 };
-
-// Sentinel used throughout the intrusive linked lists / pool free-list to
-// mean "no slot" without needing a pointer (and without needing -1 on an
-// unsigned type to be misread as a huge valid index).
-inline constexpr std::uint32_t kNullIndex = std::numeric_limits<std::uint32_t>::max();
+// OrderId is a unique 64-bit unsigned integer assigned to each resting order.
+using OrderId = std::uint64_t;
 
 // ---------------------------------------------------------------------------
-// Order handle encoding
+// Enumerations
 // ---------------------------------------------------------------------------
-// order_id is not a naive monotonic counter. It packs a generation counter
-// in the high 32 bits and the memory-pool slot index in the low 32 bits:
+
+// Defines whether an order is buying or selling.
+// - Buy: Bidding to purchase shares (Bid side)
+// - Sell: Offering to sell shares (Ask side)
+enum class Side : std::uint8_t {
+    Buy = 0,
+    Sell = 1
+};
+
+// Defines the execution policy of an order.
+// - Limit: Specifies a maximum purchase price or minimum sale price.
+// - Market: Executes immediately at the best available market price.
+enum class OrderType : std::uint8_t {
+    Limit = 0,
+    Market = 1
+};
+
+// Sentinel value used to represent an invalid or unassigned index/ID.
+constexpr std::uint32_t kNullIndex = std::numeric_limits<std::uint32_t>::max();
+
+// ---------------------------------------------------------------------------
+// Order Handle (Slot & Generation Tracking)
+// ---------------------------------------------------------------------------
+// To uniquely identify resting orders without raw pointers, an OrderId packs:
+//   1. Memory pool slot index (lower 32 bits)
+//   2. Generation counter (upper 32 bits)
 //
-//   [ 63 .......... 32 | 31 .......... 0 ]
-//   [   generation      |   pool slot    ]
-//
-// Why: pool slots are recycled the instant an order is cancelled or fully
-// filled. If IDs were just "the slot index", a stale OrderId held by a client
-// after cancellation could accidentally address a *different, newer* order
-// that reused the same slot (classic ABA problem). Bumping the generation on
-// every release and validating it on lookup turns a silent correctness bug
-// into a safe, O(1)-detectable no-op.
+// Bumping the generation counter whenever an order slot is released prevents the
+// "ABA problem" where a stale handle accidentally matches a new order in the same slot.
 struct OrderHandle {
-    std::uint32_t slot;
-    std::uint32_t generation;
+    std::uint32_t slot = 0;
+    std::uint32_t generation = 0;
 
+    // Combines slot index and generation counter into a single 64-bit OrderId.
     [[nodiscard]] constexpr OrderId encode() const noexcept {
-        return (static_cast<OrderId>(generation) << 32) | slot;
+        const auto gen_64 = static_cast<std::uint64_t>(generation);
+        const auto slot_64 = static_cast<std::uint64_t>(slot);
+        return (gen_64 << 32) | slot_64;
     }
 
+    // Extracts the slot index and generation counter from a 64-bit OrderId.
     static constexpr OrderHandle decode(OrderId id) noexcept {
+        const auto slot_part = static_cast<std::uint32_t>(id & 0xFFFFFFFFu);
+        const auto gen_part  = static_cast<std::uint32_t>(id >> 32);
         return OrderHandle{
-            .slot       = static_cast<std::uint32_t>(id & 0xFFFF'FFFFu),
-            .generation = static_cast<std::uint32_t>(id >> 32),
+            .slot = slot_part,
+            .generation = gen_part
         };
     }
 };
 
 // ---------------------------------------------------------------------------
-// Wire-format message that flows through the SPSC queue from the market-data
-// / client thread to the matching engine thread. Deliberately tiny (16
-// bytes) and trivially copyable so it can be memcpy'd across the ring buffer
-// with no allocation and no hidden ownership transfer.
+// Incoming Order Message
 // ---------------------------------------------------------------------------
-struct alignas(16) IncomingOrder {
-    Price      price;      // ignored for Market orders
-    Quantity   quantity;
-    Side       side;
-    OrderType  type;
+// Represents an order submitted to the matching engine.
+struct IncomingOrder {
+    Price     price = 0;      // Price limit (ignored for Market orders)
+    Quantity  quantity = 0;   // Number of units requested
+    Side      side = Side::Buy;
+    OrderType type = OrderType::Limit;
 };
-static_assert(sizeof(IncomingOrder) == 16);
-static_assert(std::is_trivially_copyable_v<IncomingOrder>);
 
-// Result of feeding one incoming order into the book. Reused across calls by
-// the caller (never heap-allocated by the engine) so it can be filled in and
-// inspected without allocation on the hot path.
-struct alignas(16) ExecReport {
-    OrderId  order_id;      // handle assigned to the resting remainder (0 if fully filled/rejected)
-    Quantity filled_qty;
-    Quantity remaining_qty;
-    bool     accepted;      // false if book/pool was full and the order was dropped
+// ---------------------------------------------------------------------------
+// Execution Report Message
+// ---------------------------------------------------------------------------
+// Returns the result of matching or placing an order in the book.
+struct ExecReport {
+    OrderId  order_id = 0;      // Assigned ID if remainder rests in book (0 if fully filled/rejected)
+    Quantity filled_qty = 0;    // Number of units matched and executed
+    Quantity remaining_qty = 0; // Number of units remaining unfilled
+    bool     accepted = false;  // True if order was successfully processed
 };
+
+// ---------------------------------------------------------------------------
+// Core Order Representation (Standard C++ Structures)
+// ---------------------------------------------------------------------------
+// Represents an active order resting in the order book.
+struct Order {
+    OrderId       order_id = 0;      // Unique order identifier
+    Price         price = 0;         // Limit price tick
+    Quantity      quantity = 0;      // Remaining unfilled quantity
+    std::uint32_t prev = kNullIndex; // Linked list index (previous order at same price)
+    std::uint32_t next = kNullIndex; // Linked list index (next order at same price)
+    Side          side = Side::Buy;  // Buy (Bid) or Sell (Ask)
+    bool          active = false;    // Whether this order is currently active in the book
+};
+
+// ---------------------------------------------------------------------------
+// Standard Container Definitions for Order Book Storage
+// ---------------------------------------------------------------------------
+// Standard containers provide clear, easy-to-read abstractions for the Order Book:
+//
+// 1. Price-Time Priority (FIFO Queue):
+//    Orders at the exact same price level are kept in a FIFO list (std::list<Order>).
+//    The earliest order (head of list) is matched first.
+using OrderQueue = std::list<Order>;
+
+// 2. Bid Book (Buy Orders):
+//    Bids are ordered by price in DESCENDING order (highest bid price first).
+//    std::map sorted with std::greater<Price> provides O(log N) price access
+//    and automatically keeps the best bid at the top.
+using BidBook = std::map<Price, OrderQueue, std::greater<Price>>;
+
+// 3. Ask Book (Sell Orders):
+//    Asks are ordered by price in ASCENDING order (lowest ask price first).
+//    std::map sorted with std::less<Price> provides O(log N) price access
+//    and automatically keeps the best ask at the top.
+using AskBook = std::map<Price, OrderQueue, std::less<Price>>;
+
+// ---------------------------------------------------------------------------
+// Order Matching Logic Concept & Rules (Contextual Explanation)
+// ---------------------------------------------------------------------------
+//
+// How Bid / Ask Cross-Matching Works:
+//
+// 1. Incoming BUY Limit Order (Price P):
+//    - Matches against resting SELL orders (Asks) with Price <= P.
+//    - Sweeps lowest ask prices first.
+//    - At each price level, matches orders in FIFO order (oldest order first).
+//    - Any unfilled remaining quantity rests on the Bid side at price P.
+//
+// 2. Incoming SELL Limit Order (Price P):
+//    - Matches against resting BUY orders (Bids) with Price >= P.
+//    - Sweeps highest bid prices first.
+//    - At each price level, matches orders in FIFO order (oldest order first).
+//    - Any unfilled remaining quantity rests on the Ask side at price P.
+//
+// 3. Market Orders:
+//    - Execute immediately against the best available opposite orders regardless of price.
+//    - Any unfilled remaining quantity is cancelled (does NOT rest in the book).
+// ---------------------------------------------------------------------------
 
 } // namespace hft
+

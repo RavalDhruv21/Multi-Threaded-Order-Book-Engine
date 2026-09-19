@@ -1,9 +1,16 @@
 // test_orderbook.cpp
-// Lightweight, dependency-free functional test suite (no gtest -- kept
-// self-contained so `g++ -O2 -std=c++20 tests/test_orderbook.cpp -o test`
-// just works). Exercises the correctness properties an interviewer will
-// actually probe: price-time priority, partial fills, market order sweep,
-// O(1) cancel, amend semantics, and stale-handle rejection.
+// Functional Test Suite for the Low-Latency Order Book Engine.
+//
+// Coverage Summary:
+// - Resting orders and Best Bid/Ask discovery.
+// - Full fill & partial fill crossing logic.
+// - FIFO price-time priority ordering at identical price levels.
+// - Market order sweeping across multiple price levels.
+// - Immediate-Or-Cancel (IOC) behavior for market orders.
+// - O(1) order cancellation and liquidity removal.
+// - Protection against stale handles and ABA recycled slots.
+// - Order amending (in-place quantity reduction vs cancel-replace).
+// - Graceful handling of pool exhaustion limits.
 #include <cstdio>
 #include <cstdlib>
 
@@ -11,15 +18,15 @@
 
 namespace {
 
-int g_failures = 0;
+int total_test_failures = 0;
 
-#define CHECK(cond)                                                                    \
+#define CHECK(condition)                                                                \
     do {                                                                                \
-        if (!(cond)) {                                                                  \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);        \
-            ++g_failures;                                                               \
+        if (!(condition)) {                                                             \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition);   \
+            ++total_test_failures;                                                      \
         } else {                                                                        \
-            std::printf("  ok: %s\n", #cond);                                           \
+            std::printf("  ok: %s\n", #condition);                                      \
         }                                                                               \
     } while (0)
 
@@ -27,173 +34,203 @@ using hft::IncomingOrder;
 using hft::OrderType;
 using hft::Side;
 
-// Small book for tests: fewer price levels/orders so failures are easy to reason about.
-using TestBook = hft::OrderBook<1024, 4096>;
+// Small test order book configuration for predictable testing
+using TestOrderBook = hft::OrderBook<1024, 4096>;
 
+// Test 1: Verifies placing resting limit orders and querying best bid price
 void test_resting_and_best_price() {
     std::printf("-- test_resting_and_best_price --\n");
-    TestBook book;
-    auto r1 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(r1.accepted);
-    CHECK(r1.filled_qty == 0);
-    CHECK(r1.remaining_qty == 10);
+    TestOrderBook book;
 
-    auto r2 = book.match_or_add({.price = 105, .quantity = 5, .side = Side::Buy, .type = OrderType::Limit});
-    (void)r2;
+    auto res1 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
+    CHECK(res1.accepted);
+    CHECK(res1.filled_qty == 0);
+    CHECK(res1.remaining_qty == 10);
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_bid(px, qty));
-    CHECK(px == 105); // higher bid should be best
-    CHECK(qty == 5);
+    auto res2 = book.match_or_add({.price = 105, .quantity = 5, .side = Side::Buy, .type = OrderType::Limit});
+    (void)res2;
+
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_bid(best_price, best_qty));
+    CHECK(best_price == 105); // Higher bid price (105) must take priority over 100
+    CHECK(best_qty == 5);
 }
 
+// Test 2: Verifies a fully matching cross (Buy price >= Sell price)
 void test_crossing_full_fill() {
     std::printf("-- test_crossing_full_fill --\n");
-    TestBook book;
-    book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
-    auto r = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(r.filled_qty == 10);
-    CHECK(r.remaining_qty == 0);
-    CHECK(r.order_id == 0); // fully filled, nothing rests
+    TestOrderBook book;
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(!book.best_ask(px, qty)); // ask side should now be empty
+    book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
+    auto result = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
+    
+    CHECK(result.filled_qty == 10);
+    CHECK(result.remaining_qty == 0);
+    CHECK(result.order_id == 0); // Fully filled order leaves no resting remainder
+
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(!book.best_ask(best_price, best_qty)); // Ask book should now be empty
 }
 
+// Test 3: Verifies partial fills and FIFO time priority among orders at the same price
 void test_partial_fill_and_price_time_priority() {
     std::printf("-- test_partial_fill_and_price_time_priority --\n");
-    TestBook book;
-    // Two sell orders at the same price -- FIFO: the first one in should be
-    // consumed first.
-    auto s1 = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
-    auto s2 = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
-    CHECK(s1.accepted && s2.accepted);
+    TestOrderBook book;
 
-    // Buy 7: should fully consume s1 (5) and partially consume s2 (2),
-    // leaving s2 resting with qty 3.
-    auto b = book.match_or_add({.price = 100, .quantity = 7, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(b.filled_qty == 7);
-    CHECK(b.remaining_qty == 0);
+    // Place two Sell orders at price 100
+    auto sell1 = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
+    auto sell2 = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
+    CHECK(sell1.accepted && sell2.accepted);
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_ask(px, qty));
-    CHECK(px == 100);
-    CHECK(qty == 3); // remainder of s2
+    // Incoming Buy order for 7 units: matches all 5 of sell1, then 2 of sell2
+    auto buy = book.match_or_add({.price = 100, .quantity = 7, .side = Side::Buy, .type = OrderType::Limit});
+    CHECK(buy.filled_qty == 7);
+    CHECK(buy.remaining_qty == 0);
+
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_ask(best_price, best_qty));
+    CHECK(best_price == 100);
+    CHECK(best_qty == 3); // 3 units remaining from sell2
 }
 
+// Test 4: Verifies Market order sweeping across multiple price levels
 void test_market_order_sweeps_multiple_levels() {
     std::printf("-- test_market_order_sweeps_multiple_levels --\n");
-    TestBook book;
+    TestOrderBook book;
+
     book.match_or_add({.price = 100, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
     book.match_or_add({.price = 101, .quantity = 5, .side = Side::Sell, .type = OrderType::Limit});
 
-    // Market buy for 8: should take all 5 @100 then 3 @101, ignoring price.
-    auto r = book.match_or_add({.price = 0, .quantity = 8, .side = Side::Buy, .type = OrderType::Market});
-    CHECK(r.filled_qty == 8);
-    CHECK(r.remaining_qty == 0);
+    // Market Buy order for 8 units sweeps price level 100 (5 qty) and 101 (3 qty)
+    auto result = book.match_or_add({.price = 0, .quantity = 8, .side = Side::Buy, .type = OrderType::Market});
+    CHECK(result.filled_qty == 8);
+    CHECK(result.remaining_qty == 0);
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_ask(px, qty));
-    CHECK(px == 101);
-    CHECK(qty == 2);
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_ask(best_price, best_qty));
+    CHECK(best_price == 101);
+    CHECK(best_qty == 2); // 2 units remaining at price 101
 }
 
+// Test 5: Verifies that unfulfilled Market order quantity does NOT rest in the book (IOC)
 void test_market_order_ioc_drops_remainder() {
     std::printf("-- test_market_order_ioc_drops_remainder --\n");
-    TestBook book;
+    TestOrderBook book;
+
     book.match_or_add({.price = 100, .quantity = 3, .side = Side::Sell, .type = OrderType::Limit});
 
-    auto r = book.match_or_add({.price = 0, .quantity = 10, .side = Side::Buy, .type = OrderType::Market});
-    CHECK(r.filled_qty == 3);
-    CHECK(r.remaining_qty == 7);   // unfilled remainder exists...
-    CHECK(r.order_id == 0);        // ...but is NOT resting in the book (IOC)
+    auto result = book.match_or_add({.price = 0, .quantity = 10, .side = Side::Buy, .type = OrderType::Market});
+    CHECK(result.filled_qty == 3);
+    CHECK(result.remaining_qty == 7); // Unfilled remainder of 7 units...
+    CHECK(result.order_id == 0);      // ...does NOT rest in the book (IOC cancellation)
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(!book.best_bid(px, qty));
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(!book.best_bid(best_price, best_qty)); // Buy book remains empty
 }
 
+// Test 6: Verifies order cancellation and liquidity removal
 void test_cancel_is_o1_and_removes_liquidity() {
     std::printf("-- test_cancel_is_o1_and_removes_liquidity --\n");
-    TestBook book;
-    auto r = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(r.order_id != 0);
+    TestOrderBook book;
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_bid(px, qty));
+    auto result = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Buy, .type = OrderType::Limit});
+    CHECK(result.order_id != 0);
 
-    CHECK(book.cancel_order(r.order_id));
-    CHECK(!book.best_bid(px, qty)); // level should be empty now
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_bid(best_price, best_qty));
 
-    // Double-cancel must fail cleanly, not crash / not double-release the slot.
-    CHECK(!book.cancel_order(r.order_id));
+    // Cancel order
+    CHECK(book.cancel_order(result.order_id));
+    CHECK(!book.best_bid(best_price, best_qty)); // Level is now empty
+
+    // Duplicate cancel attempt must fail gracefully
+    CHECK(!book.cancel_order(result.order_id));
 }
 
+// Test 7: Verifies ABA protection (stale order handle rejection after slot reuse)
 void test_stale_handle_after_slot_reuse_is_rejected() {
     std::printf("-- test_stale_handle_after_slot_reuse_is_rejected --\n");
-    TestBook book;
-    auto r1 = book.match_or_add({.price = 100, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
-    const hft::OrderId stale_id = r1.order_id;
-    CHECK(book.cancel_order(stale_id)); // slot freed, generation bumped
+    TestOrderBook book;
 
-    // Force the same slot to be reused by placing enough new orders that at
-    // least one reuses slot 0 (pool is LIFO free-list, so the very next
-    // acquire reuses exactly the slot we just freed).
-    auto r2 = book.match_or_add({.price = 200, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
-    (void)r2;
+    auto res1 = book.match_or_add({.price = 100, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
+    const hft::OrderId stale_handle = res1.order_id;
+    CHECK(book.cancel_order(stale_handle)); // Slot freed, generation counter incremented
 
-    // The old handle must NOT be able to cancel the new order occupying the
-    // recycled slot -- this is exactly the ABA bug generation counters exist
-    // to prevent.
-    CHECK(!book.cancel_order(stale_id));
+    // Add a new order that reuses the freed pool slot
+    auto res2 = book.match_or_add({.price = 200, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
+    (void)res2;
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_bid(px, qty));
-    CHECK(px == 200); // the new order must still be resting, untouched
+    // Attempting to cancel with the stale handle must be rejected
+    CHECK(!book.cancel_order(stale_handle));
+
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_bid(best_price, best_qty));
+    CHECK(best_price == 200); // The new order must remain active and unaffected
 }
 
+// Test 8: Verifies in-place quantity reduction retains time priority
 void test_amend_quantity_decrease_keeps_priority() {
     std::printf("-- test_amend_quantity_decrease_keeps_priority --\n");
-    TestBook book;
-    auto r1 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
-    auto r2 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
+    TestOrderBook book;
 
-    // Shrink r1's quantity in place (should keep FIFO position: still first).
-    auto amend_result = book.amend_order(r1.order_id, 100, 4);
+    auto res1 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
+    auto res2 = book.match_or_add({.price = 100, .quantity = 10, .side = Side::Sell, .type = OrderType::Limit});
+
+    // Reduce res1 quantity from 10 down to 4
+    auto amend_result = book.amend_order(res1.order_id, 100, 4);
     CHECK(amend_result.accepted);
 
-    // A buy for 4 should be filled entirely by (amended) r1, not r2.
-    auto b = book.match_or_add({.price = 100, .quantity = 4, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(b.filled_qty == 4);
+    // Matching Buy order for 4 units should fully consume res1 (which retained position #1)
+    auto buy = book.match_or_add({.price = 100, .quantity = 4, .side = Side::Buy, .type = OrderType::Limit});
+    CHECK(buy.filled_qty == 4);
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_ask(px, qty));
-    CHECK(qty == 10); // r2 fully untouched
-    (void)r2;
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_ask(best_price, best_qty));
+    CHECK(best_qty == 10); // res2 remains fully untouched at 10 units
+    (void)res2;
 }
 
+// Test 9: Verifies order reprioritization on price change amend
 void test_amend_price_change_reprioritizes() {
     std::printf("-- test_amend_price_change_reprioritizes --\n");
-    TestBook book;
-    auto r = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Buy, .type = OrderType::Limit});
-    auto amend_result = book.amend_order(r.order_id, 110, 5);
+    TestOrderBook book;
+
+    auto res = book.match_or_add({.price = 100, .quantity = 5, .side = Side::Buy, .type = OrderType::Limit});
+    auto amend_result = book.amend_order(res.order_id, 110, 5);
     CHECK(amend_result.accepted);
 
-    hft::Price px{}; hft::Quantity qty{};
-    CHECK(book.best_bid(px, qty));
-    CHECK(px == 110); // moved to the new price level
+    hft::Price best_price = 0;
+    hft::Quantity best_qty = 0;
+    CHECK(book.best_bid(best_price, best_qty));
+    CHECK(best_price == 110); // Order moved to new price level 110
 }
 
+// Test 10: Verifies graceful rejection on memory pool capacity exhaustion
 void test_pool_exhaustion_is_handled_gracefully() {
     std::printf("-- test_pool_exhaustion_is_handled_gracefully --\n");
-    hft::OrderBook<4, 4096> tiny_book; // capacity for only 4 resting orders
+    hft::OrderBook<4, 4096> tiny_book; // Capacity for exactly 4 resting orders
+
     for (int i = 0; i < 4; ++i) {
-        auto r = tiny_book.match_or_add(
-            {.price = static_cast<hft::Price>(100 + i), .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
-        CHECK(r.accepted);
+        auto res = tiny_book.match_or_add({
+            .price = static_cast<hft::Price>(100 + i), 
+            .quantity = 1, 
+            .side = Side::Buy, 
+            .type = OrderType::Limit
+        });
+        CHECK(res.accepted);
     }
-    // 5th order: pool is exhausted, must be rejected, not crash / UB.
-    auto r5 = tiny_book.match_or_add({.price = 200, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
-    CHECK(!r5.accepted);
+
+    // 5th order attempt when pool is full: must be rejected without crashing
+    auto overflow_res = tiny_book.match_or_add({.price = 200, .quantity = 1, .side = Side::Buy, .type = OrderType::Limit});
+    CHECK(!overflow_res.accepted);
 }
 
 } // namespace
@@ -210,10 +247,11 @@ int main() {
     test_amend_price_change_reprioritizes();
     test_pool_exhaustion_is_handled_gracefully();
 
-    if (g_failures == 0) {
-        std::printf("\nAll tests passed.\n");
+    if (total_test_failures == 0) {
+        std::printf("\nAll tests passed successfully.\n");
         return 0;
     }
-    std::fprintf(stderr, "\n%d check(s) FAILED.\n", g_failures);
+    std::fprintf(stderr, "\n%d test check(s) FAILED.\n", total_test_failures);
     return 1;
 }
+

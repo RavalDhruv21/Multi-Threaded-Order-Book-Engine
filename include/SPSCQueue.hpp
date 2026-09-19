@@ -1,8 +1,14 @@
 // SPSCQueue.hpp
-// Single-Producer/Single-Consumer lock-free ring buffer. One thread calls
-// push(), a different single thread calls pop(); no other thread ever
-// touches either. That constraint (vs MPMC) is what lets us get away with
-// two plain atomics and no CAS loop at all.
+// Single-Producer / Single-Consumer (SPSC) Lock-Free Ring Buffer.
+//
+// Key Concurrency Design:
+// This queue allows thread-safe communication between exactly two threads:
+//   - Producer Thread: Pushes items into the queue (calls `push`).
+//   - Consumer Thread: Pops items out of the queue (calls `pop`).
+//
+// Because only ONE thread writes to the write index (tail) and only ONE thread
+// writes to the read index (head), mutex locks or compare-and-swap (CAS) loops are NOT required.
+// Plain atomic memory barriers (`acquire` and `release`) guarantee lock-free performance.
 #pragma once
 
 #include <array>
@@ -12,81 +18,85 @@
 
 namespace hft {
 
-// Padding between head_ and tail_ so the producer's writes to tail_ and the
-// consumer's writes to head_ never land on the same cache line (false
-// sharing would otherwise bounce that line between cores on every single
-// push/pop, which is the whole "lock-free but still slow" trap). Hardcoded
-// to 64 rather than std::hardware_destructive_interference_size: that
-// constant is explicitly not ABI-stable across compilers/-mtune flags
-// (GCC warns on use), and 64 bytes is correct for every mainstream x86-64
-// and AArch64 target this project builds for.
-inline constexpr std::size_t kCacheLine = 64;
+// Standard cache line size in bytes (64 bytes for x86-64 and ARM64 processors).
+// Used to align memory structures and avoid cache line false-sharing between threads.
+constexpr std::size_t kCacheLineBytes = 64;
 
 template <typename T, std::size_t Capacity>
 class SPSCQueue {
     static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
-                  "Capacity must be a power of two (mask-based wraparound relies on it)");
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "SPSCQueue is memcpy-semantics only -- no allocation, no destructors on the hot path");
+                  "SPSCQueue Capacity must be a power of 2 (e.g., 64, 1024, 65536).");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "SPSCQueue elements must be trivially copyable for memcpy transfer.");
 
 public:
     SPSCQueue() = default;
+
+    // Prevent copying queue instances
     SPSCQueue(const SPSCQueue&)            = delete;
     SPSCQueue& operator=(const SPSCQueue&) = delete;
 
-    // Producer side only. Returns false if the queue is full (backpressure
-    // signal -- caller decides whether to spin, drop, or retry).
+    // Pushes an item into the queue. Executed by the PRODUCER thread ONLY.
+    // Returns false if the queue is full (backpressure signal).
     bool push(const T& item) noexcept {
-        const std::size_t tail = tail_.load(std::memory_order_relaxed);
-        const std::size_t next = (tail + 1) & kMask;
+        const std::size_t current_tail = tail_index_.load(std::memory_order_relaxed);
+        const std::size_t next_tail    = (current_tail + 1) & index_mask_;
 
-        // Acquire here pairs with the consumer's release store to head_:
-        // if we observe the consumer has moved head_ far enough for the
-        // slot to be free, we are guaranteed to also see everything the
-        // consumer did with that slot before publishing head_.
-        if (next == head_.load(std::memory_order_acquire)) {
-            return false; // full
+        // Check if queue is full: pairing acquire load with consumer's release store to head_index_
+        if (next_tail == head_index_.load(std::memory_order_acquire)) {
+            return false; // Queue is full
         }
 
-        buffer_[tail] = item;
+        // Store item in ring buffer slot
+        buffer_[current_tail] = item;
 
-        // Release here pairs with the consumer's acquire load of tail_:
-        // publishes both the new tail index *and* the just-written element
-        // to the consumer.
-        tail_.store(next, std::memory_order_release);
+        // Publish updated tail index to consumer using release store
+        tail_index_.store(next_tail, std::memory_order_release);
         return true;
     }
 
-    // Consumer side only. Returns false if the queue is empty.
-    bool pop(T& out) noexcept {
-        const std::size_t head = head_.load(std::memory_order_relaxed);
+    // Pops an item from the queue. Executed by the CONSUMER thread ONLY.
+    // Returns false if the queue is empty.
+    bool pop(T& output_item) noexcept {
+        const std::size_t current_head = head_index_.load(std::memory_order_relaxed);
 
-        if (head == tail_.load(std::memory_order_acquire)) {
-            return false; // empty
+        // Check if queue is empty: pairing acquire load with producer's release store to tail_index_
+        if (current_head == tail_index_.load(std::memory_order_acquire)) {
+            return false; // Queue is empty
         }
 
-        out = buffer_[head];
-        head_.store((head + 1) & kMask, std::memory_order_release);
+        // Retrieve item from ring buffer slot
+        output_item = buffer_[current_head];
+
+        // Advance head index and publish to producer using release store
+        const std::size_t next_head = (current_head + 1) & index_mask_;
+        head_index_.store(next_head, std::memory_order_release);
         return true;
     }
 
+    // Checks if the queue is empty
     [[nodiscard]] bool empty() const noexcept {
-        return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire);
+        return head_index_.load(std::memory_order_acquire) == tail_index_.load(std::memory_order_acquire);
     }
 
+    // Returns maximum capacity of the ring buffer
     [[nodiscard]] static constexpr std::size_t capacity() noexcept { return Capacity; }
 
 private:
-    static constexpr std::size_t kMask = Capacity - 1;
+    // Bitmask for fast modulo wrapping (Capacity must be a power of 2)
+    static constexpr std::size_t index_mask_ = Capacity - 1;
 
-    alignas(kCacheLine) std::array<T, Capacity> buffer_{};
+    // Ring buffer storage array aligned to cache line boundary
+    alignas(kCacheLineBytes) std::array<T, Capacity> buffer_{};
 
-    // head_ and tail_ each get their own cache line. Without this padding,
-    // a producer spinning on tail_ and a consumer spinning on head_ would
-    // constantly invalidate each other's core-local cache line even though
-    // they're logically touching "different" atomics.
-    alignas(kCacheLine) std::atomic<std::size_t> head_{0};
-    alignas(kCacheLine) std::atomic<std::size_t> tail_{0};
+    // Read index (head): Owned and modified primarily by the Consumer thread.
+    // Separated onto its own cache line to prevent false sharing with tail_index_.
+    alignas(kCacheLineBytes) std::atomic<std::size_t> head_index_{0};
+
+    // Write index (tail): Owned and modified primarily by the Producer thread.
+    // Separated onto its own cache line to prevent false sharing with head_index_.
+    alignas(kCacheLineBytes) std::atomic<std::size_t> tail_index_{0};
 };
 
 } // namespace hft
+
